@@ -604,7 +604,7 @@ static inline enum fio_ddir get_rand_ddir(struct thread_data *td)
 
 int io_u_quiesce(struct thread_data *td)
 {
-	int completed = 0;
+	int ret = 0, completed = 0;
 
 	/*
 	 * We are going to sleep, ensure that we flush anything pending as
@@ -619,17 +619,20 @@ int io_u_quiesce(struct thread_data *td)
 		td_io_commit(td);
 
 	while (td->io_u_in_flight) {
-		int ret;
-
 		ret = io_u_queued_complete(td, 1);
 		if (ret > 0)
 			completed += ret;
+		else if (ret < 0)
+			break;
 	}
 
 	if (td->flags & TD_F_REGROW_LOGS)
 		regrow_logs(td);
 
-	return completed;
+	if (completed)
+		return completed;
+
+	return ret;
 }
 
 static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
@@ -1556,7 +1559,8 @@ again:
 		assert(!(td->flags & TD_F_CHILD));
 		ret = pthread_cond_wait(&td->free_cond, &td->io_u_lock);
 		assert(ret == 0);
-		goto again;
+		if (!td->error)
+			goto again;
 	}
 
 	if (needs_lock)
@@ -1798,6 +1802,16 @@ static inline bool gtod_reduce(struct thread_data *td)
 			|| td->o.gtod_reduce;
 }
 
+static void trim_block_info(struct thread_data *td, struct io_u *io_u)
+{
+	uint32_t *info = io_u_block_info(td, io_u);
+
+	if (BLOCK_INFO_STATE(*info) >= BLOCK_STATE_TRIM_FAILURE)
+		return;
+
+	*info = BLOCK_INFO(BLOCK_STATE_TRIMMED, BLOCK_INFO_TRIMS(*info) + 1);
+}
+
 static void account_io_completion(struct thread_data *td, struct io_u *io_u,
 				  struct io_completion_data *icd,
 				  const enum fio_ddir idx, unsigned int bytes)
@@ -1849,18 +1863,8 @@ static void account_io_completion(struct thread_data *td, struct io_u *io_u,
 	} else if (ddir_sync(idx) && !td->o.disable_clat)
 		add_sync_clat_sample(&td->ts, llnsec);
 
-	if (td->ts.nr_block_infos && io_u->ddir == DDIR_TRIM) {
-		uint32_t *info = io_u_block_info(td, io_u);
-		if (BLOCK_INFO_STATE(*info) < BLOCK_STATE_TRIM_FAILURE) {
-			if (io_u->ddir == DDIR_TRIM) {
-				*info = BLOCK_INFO(BLOCK_STATE_TRIMMED,
-						BLOCK_INFO_TRIMS(*info) + 1);
-			} else if (io_u->ddir == DDIR_WRITE) {
-				*info = BLOCK_INFO_SET_STATE(BLOCK_STATE_WRITTEN,
-								*info);
-			}
-		}
-	}
+	if (td->ts.nr_block_infos && io_u->ddir == DDIR_TRIM)
+		trim_block_info(td, io_u);
 }
 
 static void file_log_write_comp(const struct thread_data *td, struct fio_file *f,

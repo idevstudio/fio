@@ -8,10 +8,27 @@
 #include <unistd.h>
 #include <errno.h>
 #include <libaio.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 
 #include "../fio.h"
 #include "../lib/pow2.h"
 #include "../optgroup.h"
+#include "../lib/memalign.h"
+
+#ifndef IOCB_FLAG_HIPRI
+#define IOCB_FLAG_HIPRI	(1 << 2)
+#endif
+
+#ifndef IOCTX_FLAG_USERIOCB
+#define IOCTX_FLAG_USERIOCB	(1 << 0)
+#endif
+#ifndef IOCTX_FLAG_IOPOLL
+#define IOCTX_FLAG_IOPOLL	(1 << 1)
+#endif
+#ifndef IOCTX_FLAG_FIXEDBUFS
+#define IOCTX_FLAG_FIXEDBUFS	(1 << 2)
+#endif
 
 static int fio_libaio_commit(struct thread_data *td);
 
@@ -20,6 +37,9 @@ struct libaio_data {
 	struct io_event *aio_events;
 	struct iocb **iocbs;
 	struct io_u **io_us;
+
+	struct iocb *user_iocbs;
+	struct io_u **io_u_index;
 
 	/*
 	 * Basic ring buffer. 'head' is incremented in _queue(), and
@@ -39,6 +59,9 @@ struct libaio_data {
 struct libaio_options {
 	void *pad;
 	unsigned int userspace_reap;
+	unsigned int hipri;
+	unsigned int useriocb;
+	unsigned int fixedbufs;
 };
 
 static struct fio_option options[] = {
@@ -48,6 +71,33 @@ static struct fio_option options[] = {
 		.type	= FIO_OPT_STR_SET,
 		.off1	= offsetof(struct libaio_options, userspace_reap),
 		.help	= "Use alternative user-space reap implementation",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_LIBAIO,
+	},
+	{
+		.name	= "hipri",
+		.lname	= "High Priority",
+		.type	= FIO_OPT_STR_SET,
+		.off1	= offsetof(struct libaio_options, hipri),
+		.help	= "Use polled IO completions",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_LIBAIO,
+	},
+	{
+		.name	= "useriocb",
+		.lname	= "User IOCBs",
+		.type	= FIO_OPT_STR_SET,
+		.off1	= offsetof(struct libaio_options, useriocb),
+		.help	= "Use user mapped IOCBs",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_LIBAIO,
+	},
+	{
+		.name	= "fixedbufs",
+		.lname	= "Fixed (pre-mapped) IO buffers",
+		.type	= FIO_OPT_STR_SET,
+		.off1	= offsetof(struct libaio_options, fixedbufs),
+		.help	= "Pre map IO buffers",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_LIBAIO,
 	},
@@ -67,14 +117,38 @@ static inline void ring_inc(struct libaio_data *ld, unsigned int *val,
 
 static int fio_libaio_prep(struct thread_data fio_unused *td, struct io_u *io_u)
 {
+	struct libaio_data *ld = td->io_ops_data;
 	struct fio_file *f = io_u->file;
+	struct libaio_options *o = td->eo;
+	struct iocb *iocb;
 
-	if (io_u->ddir == DDIR_READ)
-		io_prep_pread(&io_u->iocb, f->fd, io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);
-	else if (io_u->ddir == DDIR_WRITE)
-		io_prep_pwrite(&io_u->iocb, f->fd, io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);
-	else if (ddir_sync(io_u->ddir))
-		io_prep_fsync(&io_u->iocb, f->fd);
+	if (o->useriocb)
+		iocb = &ld->user_iocbs[io_u->index];
+	else
+		iocb = &io_u->iocb;
+
+	if (io_u->ddir == DDIR_READ) {
+		if (o->fixedbufs) {
+			iocb->aio_fildes = f->fd;
+			iocb->aio_lio_opcode = IO_CMD_PREAD;
+			iocb->u.c.offset = io_u->offset;
+		} else {
+			io_prep_pread(iocb, f->fd, io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);
+			if (o->hipri)
+				iocb->u.c.flags |= IOCB_FLAG_HIPRI;
+		}
+	} else if (io_u->ddir == DDIR_WRITE) {
+		if (o->fixedbufs) {
+			iocb->aio_fildes = f->fd;
+			iocb->aio_lio_opcode = IO_CMD_PWRITE;
+			iocb->u.c.offset = io_u->offset;
+		} else {
+			io_prep_pwrite(iocb, f->fd, io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);
+			if (o->hipri)
+				iocb->u.c.flags |= IOCB_FLAG_HIPRI;
+		}
+	} else if (ddir_sync(io_u->ddir))
+		io_prep_fsync(iocb, f->fd);
 
 	return 0;
 }
@@ -82,11 +156,16 @@ static int fio_libaio_prep(struct thread_data fio_unused *td, struct io_u *io_u)
 static struct io_u *fio_libaio_event(struct thread_data *td, int event)
 {
 	struct libaio_data *ld = td->io_ops_data;
+	struct libaio_options *o = td->eo;
 	struct io_event *ev;
 	struct io_u *io_u;
 
 	ev = ld->aio_events + event;
-	io_u = container_of(ev->obj, struct io_u, iocb);
+	if (o->useriocb) {
+		int index = (int) (uintptr_t) ev->obj;
+		io_u = ld->io_u_index[index];
+	} else
+		io_u = container_of(ev->obj, struct io_u, iocb);
 
 	if (ev->res != io_u->xfer_buflen) {
 		if (ev->res > io_u->xfer_buflen)
@@ -182,6 +261,7 @@ static enum fio_q_status fio_libaio_queue(struct thread_data *td,
 					  struct io_u *io_u)
 {
 	struct libaio_data *ld = td->io_ops_data;
+	struct libaio_options *o = td->eo;
 
 	fio_ro_check(td, io_u);
 
@@ -212,7 +292,11 @@ static enum fio_q_status fio_libaio_queue(struct thread_data *td,
 		return FIO_Q_COMPLETED;
 	}
 
-	ld->iocbs[ld->head] = &io_u->iocb;
+	if (o->useriocb)
+		ld->iocbs[ld->head] = (struct iocb *) (uintptr_t) io_u->index;
+	else
+		ld->iocbs[ld->head] = &io_u->iocb;
+
 	ld->io_us[ld->head] = io_u;
 	ring_inc(ld, &ld->head, 1);
 	ld->queued++;
@@ -331,32 +415,109 @@ static void fio_libaio_cleanup(struct thread_data *td)
 		free(ld->aio_events);
 		free(ld->iocbs);
 		free(ld->io_us);
+		if (ld->user_iocbs) {
+			size_t size = td->o.iodepth * sizeof(struct iocb);
+			fio_memfree(ld->user_iocbs, size, false);
+		}
 		free(ld);
 	}
+}
+
+static int fio_libaio_old_queue_init(struct libaio_data *ld, unsigned int depth,
+				     bool hipri, bool useriocb, bool fixedbufs)
+{
+	if (hipri) {
+		log_err("fio: polled aio not available on your platform\n");
+		return 1;
+	}
+	if (useriocb) {
+		log_err("fio: user mapped iocbs not available on your platform\n");
+		return 1;
+	}
+	if (fixedbufs) {
+		log_err("fio: fixed buffers not available on your platform\n");
+		return 1;
+	}
+
+	return io_queue_init(depth, &ld->aio_ctx);
+}
+
+static int fio_libaio_queue_init(struct libaio_data *ld, unsigned int depth,
+				 bool hipri, bool useriocb, bool fixedbufs)
+{
+#ifdef __NR_sys_io_setup2
+	int ret, flags = 0;
+
+	if (hipri)
+		flags |= IOCTX_FLAG_IOPOLL;
+	if (useriocb)
+		flags |= IOCTX_FLAG_USERIOCB;
+	if (fixedbufs) {
+		struct rlimit rlim = {
+			.rlim_cur = RLIM_INFINITY,
+			.rlim_max = RLIM_INFINITY,
+		};
+
+		setrlimit(RLIMIT_MEMLOCK, &rlim);
+		flags |= IOCTX_FLAG_FIXEDBUFS;
+	}
+
+	ret = syscall(__NR_sys_io_setup2, depth, flags, ld->user_iocbs,
+			NULL, NULL, &ld->aio_ctx);
+	if (!ret)
+		return 0;
+	/* fall through to old syscall */
+#endif
+	return fio_libaio_old_queue_init(ld, depth, hipri, useriocb, fixedbufs);
+}
+
+static int fio_libaio_post_init(struct thread_data *td)
+{
+	struct libaio_data *ld = td->io_ops_data;
+	struct libaio_options *o = td->eo;
+	struct io_u *io_u;
+	struct iocb *iocb;
+	int err = 0;
+
+	if (o->fixedbufs) {
+		int i;
+
+		for (i = 0; i < td->o.iodepth; i++) {
+			io_u = ld->io_u_index[i];
+			iocb = &ld->user_iocbs[i];
+			iocb->u.c.buf = io_u->buf;
+			iocb->u.c.nbytes = td_max_bs(td);
+
+			iocb->u.c.flags = 0;
+			if (o->hipri)
+				iocb->u.c.flags |= IOCB_FLAG_HIPRI;
+		}
+	}
+
+	err = fio_libaio_queue_init(ld, td->o.iodepth, o->hipri, o->useriocb,
+					o->fixedbufs);
+	if (err) {
+		td_verror(td, -err, "io_queue_init");
+		return 1;
+	}
+
+	return 0;
 }
 
 static int fio_libaio_init(struct thread_data *td)
 {
 	struct libaio_options *o = td->eo;
 	struct libaio_data *ld;
-	int err = 0;
 
 	ld = calloc(1, sizeof(*ld));
 
-	/*
-	 * First try passing in 0 for queue depth, since we don't
-	 * care about the user ring. If that fails, the kernel is too old
-	 * and we need the right depth.
-	 */
-	if (!o->userspace_reap)
-		err = io_queue_init(INT_MAX, &ld->aio_ctx);
-	if (o->userspace_reap || err == -EINVAL)
-		err = io_queue_init(td->o.iodepth, &ld->aio_ctx);
-	if (err) {
-		td_verror(td, -err, "io_queue_init");
-		log_err("fio: check /proc/sys/fs/aio-max-nr\n");
-		free(ld);
-		return 1;
+	if (o->useriocb) {
+		size_t size;
+
+		ld->io_u_index = calloc(td->o.iodepth, sizeof(struct io_u *));
+		size = td->o.iodepth * sizeof(struct iocb);
+		ld->user_iocbs = fio_memalign(page_size, size, false);
+		memset(ld->user_iocbs, 0, size);
 	}
 
 	ld->entries = td->o.iodepth;
@@ -369,10 +530,25 @@ static int fio_libaio_init(struct thread_data *td)
 	return 0;
 }
 
+static int fio_libaio_io_u_init(struct thread_data *td, struct io_u *io_u)
+{
+	struct libaio_options *o = td->eo;
+
+	if (o->useriocb) {
+		struct libaio_data *ld = td->io_ops_data;
+
+		ld->io_u_index[io_u->index] = io_u;
+	}
+
+	return 0;
+}
+
 static struct ioengine_ops ioengine = {
 	.name			= "libaio",
 	.version		= FIO_IOOPS_VERSION,
 	.init			= fio_libaio_init,
+	.post_init		= fio_libaio_post_init,
+	.io_u_init		= fio_libaio_io_u_init,
 	.prep			= fio_libaio_prep,
 	.queue			= fio_libaio_queue,
 	.commit			= fio_libaio_commit,

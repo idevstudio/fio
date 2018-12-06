@@ -361,6 +361,7 @@ CYGWIN*)
   output_sym "CONFIG_WINDOWSAIO"
   # We now take the regular configuration path without having exit 0 here.
   # Flags below are still necessary mostly for MinGW.
+  build_static="yes"
   socklen_t="yes"
   rusage_thread="yes"
   fdatasync="yes"
@@ -1147,28 +1148,6 @@ if compile_prog "" "" "guasi"; then
   guasi="yes"
 fi
 print_config "GUASI" "$guasi"
-
-##########################################
-# fusion-aw probe
-if test "$fusion_aw" != "yes" ; then
-  fusion_aw="no"
-fi
-cat > $TMPC << EOF
-#include <nvm/nvm_primitives.h>
-int main(int argc, char **argv)
-{
-  nvm_version_t ver_info;
-  nvm_handle_t handle;
-
-  handle = nvm_get_handle(0, &ver_info);
-  return nvm_atomic_write(handle, 0, 0, 0);
-}
-EOF
-if compile_prog "" "-L/usr/lib/fio -L/usr/lib/nvm -lnvm-primitives -ldl -lpthread" "fusion-aw"; then
-  LIBS="-L/usr/lib/fio -L/usr/lib/nvm -lnvm-primitives -ldl -lpthread $LIBS"
-  fusion_aw="yes"
-fi
-print_config "Fusion-io atomic engine" "$fusion_aw"
 
 ##########################################
 # libnuma probe
@@ -2293,6 +2272,29 @@ if test "$disable_native" = "no" && test "$disable_opt" != "yes" && \
 fi
 print_config "Build march=native" "$build_native"
 
+##########################################
+# check for -lcunit
+if test "$cunit" != "yes" ; then
+  cunit="no"
+fi
+cat > $TMPC << EOF
+#include <CUnit/CUnit.h>
+#include <CUnit/Basic.h>
+int main(void)
+{
+  if (CU_initialize_registry() != CUE_SUCCESS)
+    return CU_get_error();
+  CU_basic_set_mode(CU_BRM_VERBOSE);
+  CU_basic_run_tests();
+  CU_cleanup_registry();
+  return CU_get_error();
+}
+EOF
+if compile_prog "" "-lcunit" "CUnit"; then
+  cunit="yes"
+fi
+print_config "CUnit" "$cunit"
+
 #############################################################################
 
 if test "$wordsize" = "64" ; then
@@ -2404,9 +2406,6 @@ if test "$linux_splice" = "yes" ; then
 fi
 if test "$guasi" = "yes" ; then
   output_sym "CONFIG_GUASI"
-fi
-if test "$fusion_aw" = "yes" ; then
-  output_sym "CONFIG_FUSION_AW"
 fi
 if test "$libnuma_v2" = "yes" ; then
   output_sym "CONFIG_LIBNUMA"
@@ -2560,6 +2559,9 @@ if test "$mkdir_two" = "yes" ; then
 fi
 if test "$march_set" = "no" && test "$build_native" = "yes" ; then
   output_sym "CONFIG_BUILD_NATIVE"
+fi
+if test "$cunit" = "yes" ; then
+  output_sym "CONFIG_HAVE_CUNIT"
 fi
 
 echo "LIBS+=$LIBS" >> $config_host_mak

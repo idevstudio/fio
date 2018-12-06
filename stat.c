@@ -416,7 +416,6 @@ static void display_lat(const char *name, unsigned long long min,
 static void show_ddir_status(struct group_run_stats *rs, struct thread_stat *ts,
 			     int ddir, struct buf_output *out)
 {
-	const char *str[] = { " read", "write", " trim", "sync" };
 	unsigned long runt;
 	unsigned long long min, max, bw, iops;
 	double mean, dev;
@@ -426,12 +425,12 @@ static void show_ddir_status(struct group_run_stats *rs, struct thread_stat *ts,
 	if (ddir_sync(ddir)) {
 		if (calc_lat(&ts->sync_stat, &min, &max, &mean, &dev)) {
 			log_buf(out, "  %s:\n", "fsync/fdatasync/sync_file_range");
-			display_lat(str[ddir], min, max, mean, dev, out);
+			display_lat(io_ddir_name(ddir), min, max, mean, dev, out);
 			show_clat_percentiles(ts->io_u_sync_plat,
 						ts->sync_stat.samples,
 						ts->percentile_list,
 						ts->percentile_precision,
-						str[ddir], out);
+						io_ddir_name(ddir), out);
 		}
 		return;
 	}
@@ -455,7 +454,7 @@ static void show_ddir_status(struct group_run_stats *rs, struct thread_stat *ts,
 		zbd_w_st = zbd_write_status(ts);
 
 	log_buf(out, "  %s: IOPS=%s, BW=%s (%s)(%s/%llumsec)%s\n",
-			rs->unified_rw_rep ? "mixed" : str[ddir],
+			rs->unified_rw_rep ? "mixed" : io_ddir_name(ddir),
 			iops_p, bw_p, bw_p_alt, io_p,
 			(unsigned long long) ts->runtime[ddir],
 			zbd_w_st ? : "");
@@ -985,7 +984,6 @@ static void add_ddir_status_json(struct thread_stat *ts,
 	double mean, dev, iops;
 	unsigned int len;
 	int i;
-	const char *ddirname[] = { "read", "write", "trim", "sync" };
 	struct json_object *dir_object, *tmp_object, *percentile_object, *clat_bins_object = NULL;
 	char buf[120];
 	double p_of_agg = 100.0;
@@ -997,7 +995,7 @@ static void add_ddir_status_json(struct thread_stat *ts,
 
 	dir_object = json_create_object();
 	json_object_add_value_object(parent,
-		ts->unified_rw_rep ? "mixed" : ddirname[ddir], dir_object);
+		ts->unified_rw_rep ? "mixed" : io_ddir_name(ddir), dir_object);
 
 	if (ddir_rw(ddir)) {
 		bw_bytes = 0;
@@ -1059,10 +1057,16 @@ static void add_ddir_status_json(struct thread_stat *ts,
 
 	if (ts->clat_percentiles || ts->lat_percentiles) {
 		if (ddir_rw(ddir)) {
+			uint64_t samples;
+
+			if (ts->clat_percentiles)
+				samples = ts->clat_stat[ddir].samples;
+			else
+				samples = ts->lat_stat[ddir].samples;
+
 			len = calc_clat_percentiles(ts->io_u_plat[ddir],
-					ts->clat_stat[ddir].samples,
-					ts->percentile_list, &ovals, &maxv,
-					&minv);
+					samples, ts->percentile_list, &ovals,
+					&maxv, &minv);
 		} else {
 			len = calc_clat_percentiles(ts->io_u_sync_plat,
 					ts->sync_stat.samples,
@@ -1514,12 +1518,9 @@ struct json_object *show_thread_status(struct thread_stat *ts,
 	return ret;
 }
 
-static void sum_stat(struct io_stat *dst, struct io_stat *src, bool first)
+static void __sum_stat(struct io_stat *dst, struct io_stat *src, bool first)
 {
 	double mean, S;
-
-	if (src->samples == 0)
-		return;
 
 	dst->min_val = min(dst->min_val, src->min_val);
 	dst->max_val = max(dst->max_val, src->max_val);
@@ -1547,6 +1548,39 @@ static void sum_stat(struct io_stat *dst, struct io_stat *src, bool first)
 	dst->samples += src->samples;
 	dst->mean.u.f = mean;
 	dst->S.u.f = S;
+
+}
+
+/*
+ * We sum two kinds of stats - one that is time based, in which case we
+ * apply the proper summing technique, and then one that is iops/bw
+ * numbers. For group_reporting, we should just add those up, not make
+ * them the mean of everything.
+ */
+static void sum_stat(struct io_stat *dst, struct io_stat *src, bool first,
+		     bool pure_sum)
+{
+	if (src->samples == 0)
+		return;
+
+	if (!pure_sum) {
+		__sum_stat(dst, src, first);
+		return;
+	}
+
+	if (first) {
+		dst->min_val = src->min_val;
+		dst->max_val = src->max_val;
+		dst->samples = src->samples;
+		dst->mean.u.f = src->mean.u.f;
+		dst->S.u.f = src->S.u.f;
+	} else {
+		dst->min_val += src->min_val;
+		dst->max_val += src->max_val;
+		dst->samples += src->samples;
+		dst->mean.u.f += src->mean.u.f;
+		dst->S.u.f += src->S.u.f;
+	}
 }
 
 void sum_group_stats(struct group_run_stats *dst, struct group_run_stats *src)
@@ -1582,22 +1616,22 @@ void sum_thread_stats(struct thread_stat *dst, struct thread_stat *src,
 
 	for (l = 0; l < DDIR_RWDIR_CNT; l++) {
 		if (!dst->unified_rw_rep) {
-			sum_stat(&dst->clat_stat[l], &src->clat_stat[l], first);
-			sum_stat(&dst->slat_stat[l], &src->slat_stat[l], first);
-			sum_stat(&dst->lat_stat[l], &src->lat_stat[l], first);
-			sum_stat(&dst->bw_stat[l], &src->bw_stat[l], first);
-			sum_stat(&dst->iops_stat[l], &src->iops_stat[l], first);
+			sum_stat(&dst->clat_stat[l], &src->clat_stat[l], first, false);
+			sum_stat(&dst->slat_stat[l], &src->slat_stat[l], first, false);
+			sum_stat(&dst->lat_stat[l], &src->lat_stat[l], first, false);
+			sum_stat(&dst->bw_stat[l], &src->bw_stat[l], first, true);
+			sum_stat(&dst->iops_stat[l], &src->iops_stat[l], first, true);
 
 			dst->io_bytes[l] += src->io_bytes[l];
 
 			if (dst->runtime[l] < src->runtime[l])
 				dst->runtime[l] = src->runtime[l];
 		} else {
-			sum_stat(&dst->clat_stat[0], &src->clat_stat[l], first);
-			sum_stat(&dst->slat_stat[0], &src->slat_stat[l], first);
-			sum_stat(&dst->lat_stat[0], &src->lat_stat[l], first);
-			sum_stat(&dst->bw_stat[0], &src->bw_stat[l], first);
-			sum_stat(&dst->iops_stat[0], &src->iops_stat[l], first);
+			sum_stat(&dst->clat_stat[0], &src->clat_stat[l], first, false);
+			sum_stat(&dst->slat_stat[0], &src->slat_stat[l], first, false);
+			sum_stat(&dst->lat_stat[0], &src->lat_stat[l], first, false);
+			sum_stat(&dst->bw_stat[0], &src->bw_stat[l], first, true);
+			sum_stat(&dst->iops_stat[0], &src->iops_stat[l], first, true);
 
 			dst->io_bytes[0] += src->io_bytes[l];
 
@@ -1612,7 +1646,7 @@ void sum_thread_stats(struct thread_stat *dst, struct thread_stat *src,
 		}
 	}
 
-	sum_stat(&dst->sync_stat, &src->sync_stat, first);
+	sum_stat(&dst->sync_stat, &src->sync_stat, first, false);
 	dst->usr_time += src->usr_time;
 	dst->sys_time += src->sys_time;
 	dst->ctx += src->ctx;
@@ -1928,8 +1962,6 @@ void __show_run_stats(void)
 		if (is_backend) {
 			fio_server_send_job_options(opt_lists[i], i);
 			fio_server_send_ts(ts, rs);
-			if (output_format & FIO_OUTPUT_TERSE)
-				show_thread_status_terse(ts, rs, &output[__FIO_OUTPUT_TERSE]);
 		} else {
 			if (output_format & FIO_OUTPUT_TERSE)
 				show_thread_status_terse(ts, rs, &output[__FIO_OUTPUT_TERSE]);
